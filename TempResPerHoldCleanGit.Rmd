@@ -1,0 +1,177 @@
+---
+title: 'MonthlyStudyPermitHolders: Cntry & Qrts'
+author: "McKenzie"
+date: "2023-12-09"
+output: html_document
+---
+
+### Packages
+```{r setup, include=FALSE}
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+library(httr)
+```
+
+### Read Data Source
+
+```{r}
+URL<-'https://www.ircc.canada.ca/opendata-donneesouvertes/data/EN_ODP-TR-Study-IS_CITZ_sign_date.xlsx'
+
+#ISOCodes<-'https://datahub.io/core/country-list/data.csv'
+GET(URL,write_disk(tf<-tempfile(fileext = '.xlsx')))
+
+SP<-read_excel(tf,1L,skip = 4)
+```
+
+Identifying data source date ranges based on title within file.
+```{r}
+SPDates<-read_excel(tf,1L,col_names = FALSE)[1,1]
+print(SPDates)
+SPDates<-SPDates[[1]]
+
+#Reg ex to pull date ranges
+
+StartDate<-'+\\d{4}'
+
+#Date Ranges 
+Years<-regmatches(SPDates,gregexpr(StartDate,SPDates,
+                                     ignore.case = TRUE))[[1]]
+#Range of years within the dataset
+YearsRange<-Years[1]:Years[2]
+
+```
+
+### Cleaning Column Names
+
+```{r}
+
+#Columns to clean 
+SPColnames<-colnames(SP)[2:ncol(SP)]
+
+#Add in years to column names
+replicated_years<-rep(YearsRange,each = round(length(SPColnames)/length(YearsRange),0)+1)
+#At this point each year in the replicated years variable represents either a month, a quarter or a year total. The next line of code will keep only dates from the start of the data source to the most recent month. 
+replicated_years<-replicated_years[1:length(SPColnames)]
+print(replicated_years)
+SPColnames<- paste(SPColnames,replicated_years, sep = '-')
+SPColnames
+#Drop extra characters
+SPColnames<-sub("\\..*?-","-",SPColnames)
+#Add total title to appropriate column names. 
+SPColnames<-ifelse(nchar(SPColnames)==5, paste("Total", SPColnames,sep = ''), SPColnames)
+#Apply titles to DS
+colnames(SP)<-c('Country',SPColnames)
+```
+
+cleaning some country codes 
+	
+Bahama Islands, The = Bahamas
+Saint-Martin = Saint Martin (French Part)
+Stateless, Country of citizenship not stated = 'Other' END
+
+```{r}
+SP$Country<-ifelse(SP$Country=='Bahama Islands, The','Bahamas',
+                     ifelse(SP$Country=='Saint-Martin','Saint Martin (French part)',
+                            ifelse(SP$Country=='Netherlands Antilles, The' | SP$Country=='Kosovo, Republic of'| SP$Country=='Stateless'|SP$Country=='Country of Citizenship not stated','Other',SP$Country)))
+```
+
+## Cleaning Missing Values
+* For now we will transform the '--' character to the average/mean of 1-4
+
+```{r}
+##We want to remove invalid rows, drop everything after the first NA
+firstNA<-which(is.na(SP[,1]))[1]
+SP<-subset(SP,seq_len(nrow(SP))<firstNA)
+
+#anything with -- will be the average of 1:4
+SP[SP=='--']<-as.character(mean(c(1,4)))
+```
+
+###Pivot
+* Lets turn the data set from a wide to long format
+
+```{r}
+#Convert columns to integer
+
+SP<-mutate_at(SP,vars(colnames(SP[2:length(SP)])),
+               function(x) as.integer(gsub(',',"",x)))
+
+SP<- SP %>%
+  pivot_longer(
+    cols = colnames(SP[2:ncol(SP)]),
+    names_to = c('Period'),
+    values_to = 'Total Study Permits'
+  )
+
+```
+
+* Creating a field to identify the level/time period detail for each record. 
+```{r}
+SP$Level<-ifelse(substr(SP$Period,1,1)=='Q','Quarterly',
+                 ifelse(substr(SP$Period,1,1)=='T','Annually','Monthly'))
+```
+
+*Adding in country codes. Going to be used to bring in regions.
+
+```{r}
+#install.packages('countrycode')
+library('countrycode')
+
+#Iso 3 code
+SP$CountryISO<-countrycode(sourcevar=SP$Country,origin = 'country.name',
+            destination = 'iso3c'
+            )
+
+#continent 
+SP$Continent<-countrycode(sourcevar=SP$Country,origin = 'country.name',
+            destination = 'continent'
+            )
+#World Bank Region 
+SP$WorldBankRegion<-countrycode(sourcevar=SP$Country,origin = 'country.name',
+            destination = 'region'
+            )
+
+
+#Could look at correlation between study permits and different datasets on world bank
+
+```
+
+* Next steps could be bring in data for the other 3 types of temporary residents (work permits, visitor rcords and temp residents.
+
+https://www.canada.ca/en/immigration-refugees-citizenship/services/new-immigrants/status-documents.html
+
+work permits: https://open.canada.ca/data/en/dataset/360024f2-17e9-4558-bfc1-3616485d65b9
+
+Temporary Work Permits: https://open.canada.ca/data/dataset/360024f2-17e9-4558-bfc1-3616485d65b9/resource/2e910f7d-100b-49d4-bab4-a32922af8459
+
+
+```{r}
+#For the purpose of the dashboard I will only focus on months and remove unique person count. 
+SP<- SP %>% 
+  filter(Level=='Monthly' & Country!='Total unique persons')
+
+## Cleaning up contient and region field
+NA_Country_Cont<-unique(SP[is.na(SP$Continent),][,1])
+SP$Continent<-ifelse(SP$Country=='United States Minor Outlying Islands','Americas',
+                      ifelse(is.na(SP$Continent)==TRUE,'Other',SP$Continent))
+
+unique(SP$Continent)
+NA_Country_Region<-unique(SP[is.na(SP$WorldBankRegion),][,1])
+SP$WorldBankRegion<-ifelse(SP$Country=='Reunion','Sub-Saharan Africa',
+                            ifelse(SP$Country=='United States Minor Outlying Islands','Other',
+                                   ifelse(SP$Country=='Western Sahara','Sub-Saharan Africa',
+                                          ifelse(is.na(SP$WorldBankRegion) ==TRUE,'Other',SP$WorldBankRegion)
+                                          )))
+unique(SP$WorldBankRegion)
+```
+
+
+```{r}
+write.csv(SP,'C:\\Users\\User\\Desktop\\Tableau\\International\\TempResPerHold\\StudyPermits.csv')
+
+
+```
+
